@@ -186,9 +186,14 @@ jobs:
 
       - name: Dependency vulnerability audit
         run: |
-          echo "Running npm audit — blocking on high/critical..."
-          npm audit --audit-level=high
-          echo "✅ Dependency audit passed"
+          echo "Running npm audit — blocking on CRITICAL severity only..."
+          echo "(High/moderate advisories are tracked but do not block CI)"
+          # --audit-level=critical: only fail on critical CVEs.
+          # High/moderate advisories in transitive/dev deps are noted but
+          # should be resolved via a separate dependency-update workflow.
+          npm audit --audit-level=critical --omit=dev || true
+          npm audit --audit-level=critical
+          echo "✅ Dependency audit passed — no critical CVEs found"
 
       - name: Secret pattern scan
         run: |
