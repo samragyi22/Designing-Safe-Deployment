@@ -7,8 +7,9 @@
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
     "test": "jest --forceExit",
-    "lint": "eslint src/**/*.js",
-    "build": "echo 'Build step not configured'",
+    "test:coverage": "jest --forceExit --coverage",
+    "lint": "eslint src/",
+    "build": "echo '[build] Orion API — no transpile step required; artifact is source'",
     "deploy": "bash scripts/deploy.sh"
   },
   "dependencies": {

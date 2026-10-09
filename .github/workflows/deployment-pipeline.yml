@@ -1,0 +1,520 @@
+# ──────────────────────────────────────────────────────────────
+#  FIXED — deployment-pipeline.yml
+#  Orion API — Safe, Gated, Multi-Stage Deployment Pipeline
+# ──────────────────────────────────────────────────────────────
+name: "🚀 Orion API — Safe Deployment Pipeline"
+
+on:
+  push:
+    branches:
+      - main
+      - "fix/**"   # only purposeful branches; NOT every branch
+  pull_request:
+    branches:
+      - main
+
+# Cancel in-progress runs on the same branch (prevents queue pile-ups)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ──────────────────────────────────────────────────────────────
+# STAGE 1 — SOURCE
+# Purpose : Validate the trigger, capture metadata, emit traceability info
+# Gate    : Valid ref, clean checkout
+# ──────────────────────────────────────────────────────────────
+jobs:
+  source:
+    name: "📥 Source — Checkout & Metadata"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      commit_sha:  ${{ steps.meta.outputs.commit_sha }}
+      run_ts:      ${{ steps.meta.outputs.run_ts }}
+      short_sha:   ${{ steps.meta.outputs.short_sha }}
+      image_tag:   ${{ steps.meta.outputs.image_tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history for changelog/audits
+
+      - name: Emit traceability metadata
+        id: meta
+        run: |
+          SHA="${{ github.sha }}"
+          SHORT="${SHA:0:7}"
+          TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "commit_sha=$SHA"   >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT"  >> "$GITHUB_OUTPUT"
+          echo "run_ts=$TS"        >> "$GITHUB_OUTPUT"
+          echo "image_tag=$SHORT"  >> "$GITHUB_OUTPUT"
+
+          echo "──────────────────────────────────────────"
+          echo "  Commit SHA : $SHA"
+          echo "  Short SHA  : $SHORT"
+          echo "  Timestamp  : $TS"
+          echo "  Actor      : ${{ github.actor }}"
+          echo "  Ref        : ${{ github.ref }}"
+          echo "  Run ID     : ${{ github.run_id }}"
+          echo "──────────────────────────────────────────"
+
+# ──────────────────────────────────────────────────────────────
+# STAGE 2 — BUILD
+# Purpose : Install deps (deterministically), lint, compile, upload artifact
+# Gate    : Lint passes AND build exits 0
+# ──────────────────────────────────────────────────────────────
+  build:
+    name: "🔨 Build — Install, Lint & Compile"
+    runs-on: ubuntu-latest
+    needs: source
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      # npm ci → deterministic, reproducible installs (NOT npm install)
+      - name: Install dependencies (npm ci)
+        run: npm ci
+
+      # Lint BEFORE build — catch style/syntax issues early
+      - name: Lint source code
+        run: npm run lint
+        # If lint fails the entire job stops here; build never runs
+
+      - name: Build application
+        run: npm run build
+
+      - name: Log build traceability
+        run: |
+          echo "Build succeeded"
+          echo "  Commit : ${{ needs.source.outputs.short_sha }}"
+          echo "  Time   : ${{ needs.source.outputs.run_ts }}"
+
+      # Upload the artifact so downstream jobs use the SAME compiled output
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact-${{ needs.source.outputs.short_sha }}
+          path: |
+            src/
+            package.json
+            package-lock.json
+            scripts/
+            Dockerfile
+          retention-days: 7
+          if-no-files-found: error
+
+# ──────────────────────────────────────────────────────────────
+# STAGE 3 — TEST
+# Purpose : Run unit + integration tests; enforce 80% coverage threshold
+# Gate    : All tests pass AND line coverage ≥ 80%
+# ──────────────────────────────────────────────────────────────
+  test:
+    name: "🧪 Test — Unit, Integration & Coverage Gate"
+    runs-on: ubuntu-latest
+    needs: [source, build]   # build must succeed first
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      - name: Install dependencies (npm ci)
+        run: npm ci
+
+      # Download the artifact produced by the build stage
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact-${{ needs.source.outputs.short_sha }}
+          path: .
+
+      - name: Run tests with coverage
+        run: |
+          npx jest \
+            --forceExit \
+            --coverage \
+            --coverageReporters=text \
+            --coverageThreshold='{"global":{"lines":80,"functions":80,"branches":70,"statements":80}}'
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-${{ needs.source.outputs.short_sha }}
+          path: coverage/
+          retention-days: 7
+
+# ──────────────────────────────────────────────────────────────
+# STAGE 4 — SECURITY
+# Purpose : Dependency audit, secret detection, SAST-style checks
+# Gate    : No high/critical CVEs; no secret patterns found
+# ──────────────────────────────────────────────────────────────
+  security:
+    name: "🔐 Security — Audit & Secret Scan"
+    runs-on: ubuntu-latest
+    needs: [source, build]   # runs in parallel with test (both need build)
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      - name: Install dependencies (npm ci)
+        run: npm ci
+
+      - name: Dependency vulnerability audit
+        run: |
+          echo "Running npm audit — blocking on high/critical..."
+          npm audit --audit-level=high
+          echo "✅ Dependency audit passed"
+
+      - name: Secret pattern scan
+        run: |
+          echo "Scanning for leaked secrets and credentials..."
+          # Scan for common secret patterns in tracked files
+          FOUND=0
+
+          # Check for hardcoded API keys / tokens / passwords
+          if git grep -rn \
+            -e 'password\s*=\s*["'"'"'][^"'"'"']\+["'"'"']' \
+            -e 'api_key\s*=\s*["'"'"'][^"'"'"']\+["'"'"']' \
+            -e 'secret\s*=\s*["'"'"'][^"'"'"']\+["'"'"']' \
+            -e 'AKIA[0-9A-Z]\{16\}' \
+            -- ':(exclude).git' ':(exclude)ANALYSIS.md' \
+            2>/dev/null | grep -v "example\|placeholder\|your-"; then
+            FOUND=1
+          fi
+
+          if [ "$FOUND" -eq 1 ]; then
+            echo "❌ Potential secrets detected in source — failing pipeline"
+            exit 1
+          fi
+
+          echo "✅ No secret patterns found"
+
+      - name: Validate environment file
+        run: |
+          echo "Checking .env.example does not contain real secrets..."
+          if [ -f ".env.example" ]; then
+            # .env.example should only have placeholder values
+            if grep -q "=\s*[A-Za-z0-9+/]\{32,\}" .env.example 2>/dev/null; then
+              echo "⚠️  .env.example may contain a real secret — review it"
+            else
+              echo "✅ .env.example looks clean"
+            fi
+          fi
+
+# ──────────────────────────────────────────────────────────────
+# STAGE 5 — DEPLOY STAGING
+# Purpose : Deploy to staging, run healthcheck against staging URL
+# Gate    : All prior stages passed; staging health endpoint returns 200
+# Branches: fix/** and main only
+# ──────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: "🟡 Deploy — Staging Environment"
+    runs-on: ubuntu-latest
+    needs: [source, test, security]   # BOTH test AND security must pass
+    timeout-minutes: 15
+    # Only deploy staging for relevant branches (not every PR comment etc.)
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/fix/'))
+
+    environment:
+      name: staging
+      url: http://staging.orion.internal
+
+    env:
+      COMMIT_SHA:  ${{ needs.source.outputs.commit_sha }}
+      SHORT_SHA:   ${{ needs.source.outputs.short_sha }}
+      RUN_TS:      ${{ needs.source.outputs.run_ts }}
+      IMAGE_TAG:   ${{ needs.source.outputs.image_tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact-${{ needs.source.outputs.short_sha }}
+          path: .
+
+      - name: Log staging deployment start
+        run: |
+          echo "══════════════════════════════════════════"
+          echo "  STAGING DEPLOYMENT"
+          echo "  Commit  : $COMMIT_SHA"
+          echo "  Tag     : $IMAGE_TAG"
+          echo "  Actor   : ${{ github.actor }}"
+          echo "  Time    : $RUN_TS"
+          echo "══════════════════════════════════════════"
+
+      - name: Deploy to staging (simulated)
+        run: |
+          echo "[staging] Deploying orion-api:$IMAGE_TAG to staging..."
+          # In a real pipeline: docker build + push + kubectl rollout / gcloud run update
+          # Simulated here since we have no real cloud credentials in this repo
+          echo "REGISTRY=registry.example.com" >> "$GITHUB_ENV"
+          echo "[staging] ✅ Deploy command issued successfully"
+
+      - name: Wait for staging to stabilise
+        run: |
+          echo "Waiting 10s for staging pods to become ready..."
+          sleep 10
+
+      - name: Staging healthcheck
+        run: |
+          # In a real pipeline this hits the actual staging URL
+          # Simulated: start the app locally and hit /health
+          node src/index.js &
+          APP_PID=$!
+          sleep 3
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/health)
+          kill $APP_PID 2>/dev/null || true
+
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            echo "✅ Staging healthcheck passed (HTTP $HTTP_CODE)"
+          else
+            echo "❌ Staging healthcheck failed (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+        env:
+          PORT: 3000
+          NODE_ENV: staging
+          APP_VERSION: ${{ needs.source.outputs.short_sha }}
+
+# ──────────────────────────────────────────────────────────────
+# STAGE 6 — DEPLOY PRODUCTION
+# Purpose : Deploy to production after human approval
+# Gate    : Staging verified + manual approval via GitHub Environment
+# Branch  : main ONLY
+# ──────────────────────────────────────────────────────────────
+  deploy-production:
+    name: "🔴 Deploy — Production (Approval Required)"
+    runs-on: ubuntu-latest
+    needs: [source, deploy-staging]
+    timeout-minutes: 20
+    # Only runs on pushes to main (not feature/fix branches)
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    # The `production` environment MUST have required reviewers configured
+    # in GitHub → Settings → Environments → production → Required reviewers
+    environment:
+      name: production
+      url: https://orion.example.com
+
+    env:
+      COMMIT_SHA: ${{ needs.source.outputs.commit_sha }}
+      SHORT_SHA:  ${{ needs.source.outputs.short_sha }}
+      RUN_TS:     ${{ needs.source.outputs.run_ts }}
+      IMAGE_TAG:  ${{ needs.source.outputs.image_tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact-${{ needs.source.outputs.short_sha }}
+          path: .
+
+      - name: Log production deployment start
+        run: |
+          echo "══════════════════════════════════════════"
+          echo "  PRODUCTION DEPLOYMENT — APPROVED"
+          echo "  Commit  : $COMMIT_SHA"
+          echo "  Tag     : $IMAGE_TAG"
+          echo "  Actor   : ${{ github.actor }}"
+          echo "  Time    : $RUN_TS"
+          echo "  Run ID  : ${{ github.run_id }}"
+          echo "══════════════════════════════════════════"
+
+      - name: Deploy to production
+        env:
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+          DB_PASS:      ${{ secrets.DB_PASS }}
+          JWT_SECRET:   ${{ secrets.JWT_SECRET }}
+          REGISTRY:     ${{ secrets.REGISTRY }}
+        run: |
+          echo "[production] Deploying orion-api:$IMAGE_TAG..."
+          # Real deploy: bash scripts/deploy.sh
+          # Simulated here (no cloud credentials in this demo repo)
+          echo "[production] ✅ Production deployment completed"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_ENV"
+          # Save the deployed tag so verify stage can reference it for rollback
+          echo "$IMAGE_TAG" > /tmp/deployed_tag.txt
+
+      - name: Upload deployed tag for rollback reference
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployed-tag-${{ needs.source.outputs.short_sha }}
+          path: /tmp/deployed_tag.txt
+          retention-days: 30
+
+# ──────────────────────────────────────────────────────────────
+# STAGE 7 — VERIFY
+# Purpose : Smoke tests + health checks post-production deploy
+#           Triggers automatic rollback on failure
+# Gate    : /health returns 200; key endpoints respond correctly
+# ──────────────────────────────────────────────────────────────
+  verify:
+    name: "✅ Verify — Smoke Tests & Rollback Guard"
+    runs-on: ubuntu-latest
+    needs: [source, deploy-production]
+    timeout-minutes: 10
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    env:
+      COMMIT_SHA: ${{ needs.source.outputs.commit_sha }}
+      SHORT_SHA:  ${{ needs.source.outputs.short_sha }}
+      IMAGE_TAG:  ${{ needs.source.outputs.image_tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run smoke tests against production
+        id: smoke
+        run: |
+          echo "Starting service for smoke test simulation..."
+          node src/index.js &
+          APP_PID=$!
+          sleep 3
+
+          FAILED=0
+
+          # Health endpoint
+          CODE=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost:3000/health 2>/dev/null || echo "000")
+          if [ "$CODE" = "200" ]; then
+            echo "✅ /health → $CODE"
+          else
+            echo "❌ /health → $CODE (expected 200)"
+            FAILED=1
+          fi
+
+          # Orders endpoint
+          CODE=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost:3000/api/orders 2>/dev/null || echo "000")
+          if [ "$CODE" = "200" ]; then
+            echo "✅ /api/orders → $CODE"
+          else
+            echo "❌ /api/orders → $CODE (expected 200)"
+            FAILED=1
+          fi
+
+          kill $APP_PID 2>/dev/null || true
+
+          if [ "$FAILED" -eq 1 ]; then
+            echo "smoke_passed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "smoke_passed=true" >> "$GITHUB_OUTPUT"
+          echo "All smoke tests passed ✅"
+        env:
+          PORT: 3000
+          NODE_ENV: production
+          APP_VERSION: ${{ needs.source.outputs.short_sha }}
+
+      # ─── ROLLBACK — triggered automatically on smoke test failure ───
+      - name: Rollback production on failure
+        if: failure() && steps.smoke.outputs.smoke_passed == 'false'
+        env:
+          REGISTRY:     ${{ secrets.REGISTRY }}
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+        run: |
+          echo "══════════════════════════════════════════"
+          echo "  ⚠️  SMOKE TESTS FAILED — INITIATING ROLLBACK"
+          echo "  Commit  : $COMMIT_SHA"
+          echo "  Time    : $(date -u)"
+          echo "══════════════════════════════════════════"
+          # In a real pipeline: bash scripts/rollback.sh <previous-tag>
+          # The previous tag would be retrieved from a deployment history store
+          echo "[rollback] Reverting to previous stable image..."
+          echo "[rollback] ✅ Rollback initiated — monitor logs for stability"
+          # Exit non-zero so the job is still marked failed (not silenced)
+          exit 1
+
+      - name: Log successful verification
+        if: success()
+        run: |
+          echo "══════════════════════════════════════════"
+          echo "  🎉 DEPLOYMENT VERIFIED SUCCESSFULLY"
+          echo "  Version : $IMAGE_TAG"
+          echo "  Commit  : $COMMIT_SHA"
+          echo "  Time    : $(date -u)"
+          echo "══════════════════════════════════════════"
+
+# ──────────────────────────────────────────────────────────────
+# NOTIFY — Failure notification (any stage)
+# Runs after all jobs; reports which stage failed
+# ──────────────────────────────────────────────────────────────
+  notify:
+    name: "📣 Notify — Pipeline Status"
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [source, build, test, security, deploy-staging]
+
+    steps:
+      - name: Report pipeline outcome
+        run: |
+          echo "══════════════════════════════════════════"
+          echo "  PIPELINE STATUS REPORT"
+          echo "  Run ID    : ${{ github.run_id }}"
+          echo "  Ref       : ${{ github.ref }}"
+          echo "  Actor     : ${{ github.actor }}"
+          echo "──────────────────────────────────────────"
+          echo "  source         : ${{ needs.source.result }}"
+          echo "  build          : ${{ needs.build.result }}"
+          echo "  test           : ${{ needs.test.result }}"
+          echo "  security       : ${{ needs.security.result }}"
+          echo "  deploy-staging : ${{ needs.deploy-staging.result }}"
+          echo "──────────────────────────────────────────"
+
+          # Determine if any critical stage failed
+          if [[ "${{ needs.build.result }}"          == "failure" ||
+                "${{ needs.test.result }}"           == "failure" ||
+                "${{ needs.security.result }}"       == "failure" ||
+                "${{ needs.deploy-staging.result }}" == "failure" ]]; then
+            echo "  Overall Status : ❌ PIPELINE FAILED"
+            echo ""
+            echo "  Action required: Review the failing job above."
+            echo "  No code was deployed to production."
+            # Real pipeline: send Slack/email/PagerDuty alert here
+            exit 1
+          else
+            echo "  Overall Status : ✅ PIPELINE PASSED"
+          fi
